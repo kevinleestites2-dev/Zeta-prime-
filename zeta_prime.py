@@ -54,6 +54,70 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
 # ─────────────────────────────────────────────
+# MODEL SWITCHER
+# ─────────────────────────────────────────────
+class ModelSwitcher:
+    MODELS = {
+        "fast":    os.getenv("OLLAMA_MODEL_FAST", "phi4-mini"),
+        "chat":    os.getenv("OLLAMA_MODEL_CHAT", "llama3.1"),
+        "coder":   os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b"),
+        "default": os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b"),
+    }
+    def select(self, prompt: str) -> str:
+        p = prompt.lower()
+        if any(k in p for k in ["write","code","debug","fix","refactor","test","optimize"]):
+            return self.MODELS["coder"]
+        if any(k in p for k in ["what","who","when","quick","simple","define"]):
+            return self.MODELS["fast"]
+        return self.MODELS["default"]
+
+# ─────────────────────────────────────────────
+# WEB SEARCH — DuckDuckGo
+# ─────────────────────────────────────────────
+class WebSearch:
+    def search(self, query: str, max_results: int = 5) -> list:
+        results = []
+        try:
+            resp = requests.get(
+                "https://api.duckduckgo.com/",
+                params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+                headers={"User-Agent": "ZetaPrime/1.0"}, timeout=10
+            )
+            data = resp.json()
+            if data.get("AbstractText"):
+                results.append({"title": data.get("Heading", query), "snippet": data["AbstractText"][:300]})
+            for t in data.get("RelatedTopics", [])[:max_results]:
+                if isinstance(t, dict) and "Text" in t:
+                    results.append({"title": t["Text"][:60], "snippet": t["Text"][:200]})
+        except Exception:
+            pass
+        if not results:
+            try:
+                resp = requests.get(
+                    f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}",
+                    headers={"User-Agent": "Mozilla/5.0"}, timeout=10
+                )
+                titles = re.findall(r'class="result__title"[^>]*>.*?<a[^>]*>(.*?)</a>', resp.text)
+                snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</span>', resp.text)
+                for i in range(min(max_results, len(titles))):
+                    results.append({
+                        "title": re.sub(r'<[^>]+>', '', titles[i]).strip(),
+                        "snippet": re.sub(r'<[^>]+>', '', snippets[i] if i < len(snippets) else "").strip()
+                    })
+            except Exception:
+                pass
+        return results
+
+    def summary(self, query: str) -> str:
+        results = self.search(query)
+        if not results: return f"No results for: {query}"
+        lines = [f"🔍 {query}\n"]
+        for i, r in enumerate(results[:5], 1):
+            lines.append(f"{i}. {r['title']}")
+            if r.get('snippet'): lines.append(f"   {r['snippet'][:150]}")
+        return "\n".join(lines)
+
+# ─────────────────────────────────────────────
 # MEMORY — SQLite-backed persistent memory
 # ─────────────────────────────────────────────
 
@@ -176,24 +240,30 @@ class LLM:
         self.base_url = base_url
         self.model = model
 
-    def generate(self, prompt: str, system: str = "", temperature: float = 0.3) -> str:
+    def generate(self, prompt: str, system: str = "", temperature: float = 0.3, retries: int = 3) -> str:
         full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
-        try:
-            resp = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model,
-                    "prompt": full_prompt,
-                    "stream": False,
-                    "options": {"temperature": temperature},
-                },
-                timeout=180,
-            )
-            resp.raise_for_status()
-            return resp.json().get("response", "")
-        except Exception as e:
-            log.error(f"[LLM] Generation failed: {e}")
-            return f"Error: {e}"
+        for attempt in range(retries):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/api/generate",
+                    json={"model": self.model, "prompt": full_prompt,
+                          "stream": False, "options": {"temperature": temperature}},
+                    timeout=180,
+                )
+                resp.raise_for_status()
+                return resp.json().get("response", "")
+            except Exception as e:
+                log.warning(f"[LLM] Attempt {attempt+1}/{retries} failed: {e}")
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                    if not self.is_available():
+                        import subprocess as _sp
+                        try:
+                            _sp.Popen(["ollama", "serve"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            time.sleep(4)
+                        except Exception:
+                            pass
+        return "[ERROR] LLM unavailable after retries"
 
     def is_available(self) -> bool:
         try:
@@ -717,6 +787,8 @@ class ZetaPrime:
         "/history": "Show session history",
         "/status": "System status",
         "/help": "Show available commands",
+        "/websearch": "Search the web (DuckDuckGo)",
+        "/model": "Switch model (fast/chat/coder)",
         "/stop": "Stop ZetaPrime",
     }
 
@@ -724,10 +796,13 @@ class ZetaPrime:
         log.info("=== ZetaPrime Initializing ===")
         self.memory = Memory(DB_PATH)
         self.llm = LLM(OLLAMA_BASE, OLLAMA_MODEL)
+        self.model_switcher = ModelSwitcher()
+        self.web_search = WebSearch()
         self.code_intel = CodeIntelligence(self.llm, self.memory)
         self.test_runner = TestRunner(self.memory)
         self.telegram = TelegramGateway(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
         self._running = True
+        self._safla_scores: list = []
 
         if self.llm.is_available():
             log.info(f"=== ZetaPrime Ready | Model: {OLLAMA_MODEL} ===")
@@ -767,6 +842,8 @@ class ZetaPrime:
             "/history": self._cmd_history,
             "/status": self._cmd_status,
             "/help": self._cmd_help,
+            "/websearch": self._cmd_websearch,
+            "/model": self._cmd_model,
             "/stop": self._cmd_stop,
         }
 
@@ -782,6 +859,11 @@ class ZetaPrime:
             response = self._cmd_chat(raw_input)
 
         self.memory.add_history("assistant", response[:2000])
+        score = 50
+        if len(response) > 100: score += 15
+        if any(k in response.lower() for k in ["error","failed","traceback"]): score -= 25
+        if any(k in response.lower() for k in ["done","success","created","✅"]): score += 20
+        self._safla_scores.append(max(0, min(100, score)))
         return response
 
     # ── Command implementations ──
@@ -1030,12 +1112,16 @@ class ZetaPrime:
 
     def _cmd_status(self, args: str) -> str:
         llm_status = "online" if self.llm.is_available() else "offline"
+        avg = sum(self._safla_scores[-10:]) / max(1, len(self._safla_scores[-10:]))
         return (
-            f"ZetaPrime Status\n"
-            f"  LLM: {llm_status} ({OLLAMA_MODEL})\n"
+            f"⚡ ZetaPrime Status\n"
+            f"  Model: {self.llm.model}\n"
+            f"  Ollama: {llm_status}\n"
             f"  Workspace: {WORKSPACE}\n"
             f"  Database: {DB_PATH}\n"
-            f"  Telegram: {'active' if self.telegram._active else 'inactive'}"
+            f"  Telegram: {'active' if self.telegram._active else 'inactive'}\n"
+            f"  SAFLA: {avg:.0f}/100 avg ({len(self._safla_scores)} tasks)\n"
+            f"  Models: {' | '.join(self.model_switcher.MODELS.values())}"
         )
 
     def _cmd_help(self, args: str) -> str:
